@@ -1,32 +1,40 @@
-use anyhow::Error;
-use clap::{CommandFactory, Parser, Subcommand};
+use anyhow::Result;
+use async_trait::async_trait;
+use clap::{Parser, Subcommand, CommandFactory};
 use is_terminal::IsTerminal;
 use lazy_static::lazy_static;
-use spin_cli::commands::{
+use spin_cli::{commands::{
     bindle::BindleCommands,
     build::BuildCommand,
     deploy::DeployCommand,
-    external::execute_external_subcommand,
     login::LoginCommand,
     new::{AddCommand, NewCommand},
     oci::OciCommands,
     plugins::PluginCommands,
     templates::TemplateCommands,
-    up::UpCommand,
-};
+    up::UpCommand, external::ExternalCommands,
+}, dispatch::Action};
+use spin_cli::dispatch::{Dispatch};
+use anyhow::anyhow;
+use spin_cli::*;
 use spin_http::HttpTrigger;
 use spin_redis_engine::RedisTrigger;
 use spin_trigger::cli::help::HelpArgsOnlyTrigger;
 use spin_trigger::cli::TriggerExecutorCommand;
 
+#[cfg(feature = "generate-completions")]
+use spin_cli::commands::generate_completions::GenerateCompletionsCommands;
+
 #[tokio::main]
-async fn main() -> Result<(), Error> {
+async fn main() -> Result<()> {
     tracing_subscriber::fmt()
         .with_writer(std::io::stderr)
         .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
         .with_ansi(std::io::stderr().is_terminal())
         .init();
-    SpinApp::parse().run().await
+    SpinApp::parse().dispatch(&Action::Help).await?;
+
+    Ok(())
 }
 
 lazy_static! {
@@ -40,28 +48,29 @@ fn version() -> &'static str {
 
 /// The Spin CLI
 #[derive(Parser)]
-#[clap(
-    name = "spin",
-    version = version(),
-)]
+#[command(id = "spin", version = version())]
 enum SpinApp {
-    #[clap(subcommand, alias = "template")]
+    #[command(subcommand, alias = "template")]
     Templates(TemplateCommands),
     New(NewCommand),
     Add(AddCommand),
     Up(UpCommand),
-    #[clap(subcommand)]
+    #[command(subcommand)]
     Bindle(BindleCommands),
-    #[clap(subcommand)]
+    #[command(subcommand)]
     Oci(OciCommands),
     Deploy(DeployCommand),
     Build(BuildCommand),
     Login(LoginCommand),
-    #[clap(subcommand, alias = "plugin")]
+    #[command(subcommand, alias = "plugin")]
     Plugins(PluginCommands),
-    #[clap(subcommand, hide = true)]
+    #[cfg(feature = "generate-completions")]
+    /// Generate shell completions
+    #[command(subcommand, hide = true)]
+    GenerateCompletions(GenerateCompletionsCommands),
+    #[command(subcommand, hide = true)]
     Trigger(TriggerCommands),
-    #[clap(external_subcommand)]
+    #[command(external_subcommand)]
     External(Vec<String>),
 }
 
@@ -73,24 +82,70 @@ enum TriggerCommands {
     HelpArgsOnly(TriggerExecutorCommand<HelpArgsOnlyTrigger>),
 }
 
-impl SpinApp {
+impl_dispatch!(TriggerCommands::{Http, Redis, HelpArgsOnly});
+
+struct External;
+impl Dispatch for External {
+
+}
+
+#[async_trait(?Send)]
+impl Dispatch for SpinApp {
     /// The main entry point to Spin.
-    pub async fn run(self) -> Result<(), Error> {
+    async fn dispatch(&self, action: &Action) -> Result<()> {
+        macro_rules! dispatch {
+            ($cmd:expr) => {
+                ($cmd).dispatch(action).await
+            };
+        }
+
+        macro_rules! external {
+            ($cmd:expr) => {
+                {
+                    let cmd: &Vec<String> = $cmd;
+                    let cmd = ExternalCommands::new(cmd.to_vec(), Self::command());
+                    dispatch!(cmd)
+                }
+            }
+        }
+
+        macro_rules! delegate {
+            ($($variant:ident),*) => {
+                $(if let Self::$variant(cmd) = self {
+                    dispatch!(cmd)?;
+                })*
+            }
+        }
+
+        delegate!(
+            Templates,
+            Up,
+            New,
+            Add,
+            Bindle,
+            Oci,
+            Deploy,
+            Build,
+            Trigger,
+            Login,
+            GenerateCompletions
+        );
+
         match self {
-            Self::Templates(cmd) => cmd.run().await,
-            Self::Up(cmd) => cmd.run().await,
-            Self::New(cmd) => cmd.run().await,
-            Self::Add(cmd) => cmd.run().await,
-            Self::Bindle(cmd) => cmd.run().await,
-            Self::Oci(cmd) => cmd.run().await,
-            Self::Deploy(cmd) => cmd.run().await,
-            Self::Build(cmd) => cmd.run().await,
-            Self::Trigger(TriggerCommands::Http(cmd)) => cmd.run().await,
-            Self::Trigger(TriggerCommands::Redis(cmd)) => cmd.run().await,
-            Self::Trigger(TriggerCommands::HelpArgsOnly(cmd)) => cmd.run().await,
-            Self::Login(cmd) => cmd.run().await,
-            Self::Plugins(cmd) => cmd.run().await,
-            Self::External(cmd) => execute_external_subcommand(cmd, SpinApp::command()).await,
+            Self::Templates(cmd) => dispatch!(cmd),
+            Self::Up(cmd) => dispatch!(cmd),
+            Self::New(cmd) => dispatch!(cmd),
+            Self::Add(cmd) => dispatch!(cmd),
+            Self::Bindle(cmd) => dispatch!(cmd),
+            Self::Oci(cmd) => dispatch!(cmd),
+            Self::Deploy(cmd) => dispatch!(cmd),
+            Self::Build(cmd) => dispatch!(cmd),
+            Self::Trigger(cmd) => dispatch!(cmd),
+            Self::Login(cmd) => dispatch!(cmd),
+            Self::Plugins(cmd) => cmd.dispatch(action).await,
+            #[cfg(feature = "generate-completions")]
+            Self::GenerateCompletions(cmd) => dispatch!(cmd),
+            Self::External(cmd) => external!(cmd)
         }
     }
 }
